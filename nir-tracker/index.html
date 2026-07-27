@@ -90,7 +90,7 @@ input[readonly] { background:#f8fafc; color:#111827; }
       </div>
     </div>
 
-    <p class="note">Operator can select the week in Weekly Input. Batch History uses the actual current week for the quick buttons. Load out uses 3 readings; all other steps use 2 readings.</p>
+    <p class="note">Operator can select the week in Weekly Input. Batch History uses the actual current week for the quick buttons. Older batches are downloaded when selected and may take a few seconds. Load out uses 3 readings; all other steps use 2 readings.</p>
 
     <div id="operatorTools" style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px">
       <button class="secondary" onclick="exportData()">Export CSV</button>
@@ -148,11 +148,11 @@ input[readonly] { background:#f8fafc; color:#111827; }
   <section id="manualEntryView" class="hidden">
     <section class="card">
       <h2 style="margin-top:0">Missing readings / manual entry</h2>
-      <p class="note">Select a batch, then enter or correct readings for any step. This saves to the live Google Sheet.</p>
+      <p class="note">Select a batch, then enter or correct readings for any step. Older batches are downloaded only when selected and may take a few seconds. This saves to the live Google Sheet.</p>
       <div class="controls">
         <div>
           <label>Batch number</label>
-          <select id="manualBatch" onchange="renderManualEntry()"></select>
+          <select id="manualBatch" onchange="handleManualBatchChange()"></select>
         </div>
         <div>
           <label>Action</label>
@@ -186,15 +186,93 @@ const batchYear = 2026;
 const defaultTargets = {"BaleBreak":[75,77],"Pre-Wet → B1":[74,76],"B1 → B2":[73,75],"B2 → B3":[72,74],"B3 → Pad":[71,73],"Filling":[71,74],"Spawning":[68,69],"Load out":[62,65]};
 const batchCalendarKey = "purecompost_nir_batch_calendar_v1";
 const defaultBatchCalendar = {"2026":52,"2027":52,"2028":53,"2029":52,"2030":52};
+const readingsCacheKey = "purecompost_nir_readings_cache_v1";
+const batchListCacheKey = "purecompost_nir_batch_list_v1";
+const readingsCacheBatchLimit = 26;
 let currentView = "weekly";
-let readings = {};
 let saveTimers = {};
 let batchCalendar = loadCachedBatchCalendar();
+let readings = loadCachedReadings();
+let latestBatchNames = new Set(batchNamesFromReadings(readings));
+let onDemandBatchNames = new Set();
+let availableBatchNames = loadCachedBatchList();
 
 function setStatus(text){ document.getElementById("status").textContent = text; }
 
 function loadTargets(){ try { return JSON.parse(localStorage.getItem(targetKey)) || defaultTargets; } catch(e){ return defaultTargets; } }
 function loadCachedBatchCalendar(){ try { return JSON.parse(localStorage.getItem(batchCalendarKey)) || defaultBatchCalendar; } catch(e){ return defaultBatchCalendar; } }
+function loadCachedReadings(){
+  try {
+    const cached = JSON.parse(localStorage.getItem(readingsCacheKey));
+    if(!cached || !cached.readings || typeof cached.readings !== "object") return {};
+    return limitReadingsToNewestBatches(cached.readings, readingsCacheBatchLimit);
+  } catch(e){
+    return {};
+  }
+}
+function loadCachedBatchList(){
+  try {
+    const batches = JSON.parse(localStorage.getItem(batchListCacheKey));
+    return Array.isArray(batches) ? batches.filter(Boolean) : [];
+  } catch(e){
+    return [];
+  }
+}
+function batchNamesFromReadings(source){
+  return [...new Set(Object.keys(source || {}).map(key => key.split("|")[0]).filter(Boolean))];
+}
+function sortBatchNamesNewestFirst(batches){
+  return [...new Set(batches || [])].sort((a,b) => {
+    try { return batchOffsetFromName(b) - batchOffsetFromName(a); }
+    catch(e){ return String(b).localeCompare(String(a)); }
+  });
+}
+function saveBatchList(){
+  try {
+    availableBatchNames = sortBatchNamesNewestFirst(availableBatchNames);
+    localStorage.setItem(batchListCacheKey, JSON.stringify(availableBatchNames));
+  } catch(e){
+    console.warn("Could not save the batch list");
+  }
+}
+function registerAvailableBatch(batch){
+  if(!batch) return;
+  if(!availableBatchNames.includes(batch)){
+    availableBatchNames.push(batch);
+    saveBatchList();
+  }
+}
+function limitReadingsToNewestBatches(source, limit){
+  const batchOffsets = {};
+  Object.keys(source || {}).forEach(key => {
+    const batch = key.split("|")[0];
+    try {
+      const offset = batchOffsetFromName(batch);
+      if(Number.isFinite(offset)) batchOffsets[batch] = offset;
+    } catch(e){}
+  });
+  const newestBatches = Object.keys(batchOffsets)
+    .sort((a,b) => batchOffsets[b] - batchOffsets[a])
+    .slice(0, limit);
+  const allowed = new Set(newestBatches);
+  const limited = {};
+  Object.keys(source || {}).forEach(key => {
+    if(allowed.has(key.split("|")[0])) limited[key] = source[key];
+  });
+  return limited;
+}
+function saveReadingsCache(){
+  try {
+    const limited = limitReadingsToNewestBatches(readings, readingsCacheBatchLimit);
+    localStorage.setItem(readingsCacheKey, JSON.stringify({
+      savedAt:new Date().toISOString(),
+      batchLimit:readingsCacheBatchLimit,
+      readings:limited
+    }));
+  } catch(e){
+    console.warn("Could not save the local readings cache");
+  }
+}
 function safeId(text){ return text.replace(/[^a-zA-Z0-9]/g, "_"); }
 function saveTargets(){
   const targets = {};
@@ -434,31 +512,136 @@ function fetchBatchCalendar(done){
   });
 }
 
-function loadLiveData(){
-  setStatus("Loading live data...");
-  let remaining = 3;
-  let rowCount = 0;
-  const finished = () => {
-    remaining -= 1;
-    if(remaining !== 0) return;
-    renderAll();
-    setStatus("Live data refreshed: " + rowCount + " rows loaded");
-  };
-  apiGet({action:"load"}, result => {
-    if(result && Array.isArray(result.rows)){
-      readings = {};
-      result.rows.forEach(row => {
-        if(!row.Batch || !row.Step) return;
-        if(row.Reading1 !== "" && row.Reading1 != null) readings[readingKey(row.Batch, row.Step, 1)] = String(row.Reading1);
-        if(row.Reading2 !== "" && row.Reading2 != null) readings[readingKey(row.Batch, row.Step, 2)] = String(row.Reading2);
-        if(row.Reading3 !== "" && row.Reading3 != null) readings[readingKey(row.Batch, row.Step, 3)] = String(row.Reading3);
-      });
-      rowCount = result.rows.length;
+function fetchBatchList(done){
+  apiGet({action:"listbatches"}, result => {
+    let changed = false;
+    if(result && result.status === "success" && Array.isArray(result.batches)){
+      const incoming = sortBatchNamesNewestFirst(result.batches);
+      if(JSON.stringify(incoming) !== JSON.stringify(availableBatchNames)){
+        availableBatchNames = incoming;
+        saveBatchList();
+        changed = true;
+      }
     }
-    finished();
+    if(done) done(changed);
   });
-  fetchSharedTargets(finished);
-  fetchBatchCalendar(finished);
+}
+
+function clearReadingsForBatch(batch, target){
+  Object.keys(target).forEach(key => {
+    if(key.split("|")[0] === batch) delete target[key];
+  });
+}
+
+function mergeRowsIntoReadings(rows, target){
+  (rows || []).forEach(row => {
+    if(!row.Batch || !row.Step) return;
+    if(row.Reading1 !== "" && row.Reading1 != null) target[readingKey(row.Batch, row.Step, 1)] = String(row.Reading1);
+    if(row.Reading2 !== "" && row.Reading2 != null) target[readingKey(row.Batch, row.Step, 2)] = String(row.Reading2);
+    if(row.Reading3 !== "" && row.Reading3 != null) target[readingKey(row.Batch, row.Step, 3)] = String(row.Reading3);
+  });
+}
+
+function applyRecentRows(result){
+  const incomingRows = Array.isArray(result.rows) ? result.rows : [];
+  const derivedBatches = sortBatchNamesNewestFirst(
+    Array.isArray(result.batches) && result.batches.length
+      ? result.batches
+      : [...new Set(incomingRows.map(row => row.Batch).filter(Boolean))]
+  ).slice(0, readingsCacheBatchLimit);
+  const recentSet = new Set(derivedBatches);
+  const nextReadings = {};
+
+  onDemandBatchNames.forEach(batch => {
+    if(recentSet.has(batch)) return;
+    Object.keys(readings).forEach(key => {
+      if(key.split("|")[0] === batch) nextReadings[key] = readings[key];
+    });
+  });
+
+  mergeRowsIntoReadings(incomingRows.filter(row => recentSet.has(row.Batch)), nextReadings);
+  readings = nextReadings;
+  latestBatchNames = recentSet;
+  derivedBatches.forEach(registerAvailableBatch);
+  saveReadingsCache();
+}
+
+function selectorBatchNames(){
+  return sortBatchNamesNewestFirst([
+    ...availableBatchNames,
+    ...batchesAround(actualWeekOffset())
+  ]);
+}
+
+function isBatchLoaded(batch){
+  return latestBatchNames.has(batch) || onDemandBatchNames.has(batch);
+}
+
+function loadBatchOnDemand(batch, done){
+  if(!batch){
+    if(done) done();
+    return;
+  }
+  if(latestBatchNames.has(batch)){
+    if(done) done();
+    return;
+  }
+
+  if(!isBatchLoaded(batch)){
+    list.innerHTML = `
+      <section class="card">
+        <div class="empty" style="text-align:center;color:#667085;padding:20px;">
+          Select this batch to load its readings from Google Sheets.
+        </div>
+      </section>`;
+    return;
+  }
+
+  setStatus("Loading batch " + batch + "...");
+  apiGet({action:"loadbatch", Batch:batch}, result => {
+    if(result && result.status === "success" && Array.isArray(result.rows)){
+      clearReadingsForBatch(batch, readings);
+      mergeRowsIntoReadings(result.rows, readings);
+      onDemandBatchNames.add(batch);
+      registerAvailableBatch(batch);
+      setStatus("Batch " + batch + " loaded");
+    } else {
+      setStatus("Batch " + batch + " could not be loaded");
+    }
+    if(done) done();
+  });
+}
+
+function loadLiveData(){
+  const cachedReadingCount = Object.keys(readings).length;
+  setStatus(cachedReadingCount ? "Showing saved readings — refreshing live data..." : "Loading live data...");
+
+  apiGet({action:"loadrecent", limit:readingsCacheBatchLimit}, result => {
+    if(result && Array.isArray(result.rows)){
+      applyRecentRows(result);
+      renderAll();
+      setStatus("Latest " + latestBatchNames.size + " batches refreshed");
+    } else if(cachedReadingCount) {
+      setStatus("Showing saved readings — live refresh unavailable");
+    } else {
+      setStatus("Live readings could not be loaded");
+    }
+  });
+
+  fetchSharedTargets(changed => {
+    if(changed && !(document.activeElement && document.activeElement.tagName === "INPUT")) renderAll();
+  });
+
+  fetchBatchCalendar(changed => {
+    if(changed){
+      saveReadingsCache();
+      if(!(document.activeElement && document.activeElement.tagName === "INPUT")) renderAll();
+    }
+  });
+
+  fetchBatchList(changed => {
+    if(changed && !(document.activeElement && document.activeElement.tagName === "INPUT")) renderAll();
+  });
 }
 
 function saveLiveRow(batch, step){
@@ -472,6 +655,7 @@ function saveLiveRow(batch, step){
     apiGet({action:"delete", Batch:batch, Step:step}, result => {
       if(result && result.status === "success"){
         for(let i=1; i<=sampleCountFor(step); i++) delete readings[readingKey(batch,step,i)];
+        saveReadingsCache();
         renderAll();
         setStatus("Entry deleted from Google Sheets");
       } else {
@@ -497,11 +681,14 @@ function saveLiveRow(batch, step){
     Average:avg === null ? "" : avg.toFixed(1)
   }, result => {
     if(result && result.status === "success"){
+      registerAvailableBatch(batch);
       if(result.deleted){
         for(let i=1; i<=sampleCountFor(step); i++) delete readings[readingKey(batch,step,i)];
+        saveReadingsCache();
         renderAll();
         setStatus("Entry deleted from Google Sheets");
       } else {
+        saveReadingsCache();
         setStatus("Saved live");
       }
     } else {
@@ -574,7 +761,7 @@ function renderHistorySelector(){
   placeholder.textContent = "Select batch";
   selector.appendChild(placeholder);
 
-  batchesAround(actualWeekOffset()).forEach(batch => {
+  selectorBatchNames().forEach(batch => {
     const option = document.createElement("option");
     option.value = batch;
     option.textContent = batch;
@@ -627,7 +814,7 @@ function selectBatchForStep(stepName, button){
   if(match){
     document.getElementById("historyBatch").value = match.batch;
     document.getElementById("historyHelper").value = stepName + " batch: " + match.batch;
-    renderHistory();
+    loadBatchOnDemand(match.batch, renderHistory);
   } else {
     document.getElementById("historyHelper").value = "No " + stepName + " batch found this week";
   }
@@ -646,7 +833,7 @@ function selectBaleLocation(label, offsetFromCurrentWeek, button){
   }
   if(selector) selector.value = batch;
   document.getElementById("historyHelper").value = label + " batch: " + batch;
-  renderHistory();
+  loadBatchOnDemand(batch, renderHistory);
 }
 
 function renderSettings(){
@@ -686,7 +873,7 @@ function renderManualBatchSelector(){
   const current = selector.value;
   selector.innerHTML = "";
 
-  batchesAround(actualWeekOffset()).forEach(batch => {
+  selectorBatchNames().forEach(batch => {
     const option = document.createElement("option");
     option.value = batch;
     option.textContent = batch;
@@ -704,6 +891,16 @@ function renderManualEntry(){
 
   const batch = selector.value || batchNameFromOffset(actualWeekOffset());
   const start = batchStartDate(batch);
+
+  if(!isBatchLoaded(batch)){
+    list.innerHTML = `
+      <section class="card">
+        <div class="empty" style="text-align:center;color:#667085;padding:20px;">
+          Select this batch to load its readings from Google Sheets.
+        </div>
+      </section>`;
+    return;
+  }
 
   let html = `<div class="batch-history-card"><div class="sample-title"><span>Batch ${batch}</span><span>Start ${formatDate(start)}</span></div>`;
 
@@ -729,6 +926,24 @@ function renderManualEntry(){
   list.innerHTML = html;
 }
 
+function handleHistoryBatchChange(){
+  const batch = document.getElementById("historyBatch").value;
+  if(!batch){
+    renderHistory();
+    return;
+  }
+  loadBatchOnDemand(batch, renderHistory);
+}
+
+function handleManualBatchChange(){
+  const batch = document.getElementById("manualBatch").value;
+  if(!batch){
+    renderManualEntry();
+    return;
+  }
+  loadBatchOnDemand(batch, renderManualEntry);
+}
+
 function showManualEntry(){
   currentView = "manual";
   document.getElementById("weeklyView").classList.add("hidden");
@@ -740,7 +955,7 @@ function showManualEntry(){
   document.getElementById("weeklyTab").className = "tab-inactive";
   document.getElementById("historyTab").className = "tab-inactive";
   renderManualBatchSelector();
-  renderManualEntry();
+  handleManualBatchChange();
 }
 
 function silentAutoRefresh(){
@@ -758,29 +973,24 @@ function silentAutoRefresh(){
     setStatus("Live data and settings auto-refreshed");
   };
 
-  apiGet({action:"load"}, result => {
+  apiGet({action:"loadrecent", limit:readingsCacheBatchLimit}, result => {
     if(!result || !Array.isArray(result.rows)){
       finished(false);
       return;
     }
-    const newReadings = {};
-
-    result.rows.forEach(row => {
-      if(!row.Batch || !row.Step) return;
-      if(row.Reading1 !== "" && row.Reading1 != null) newReadings[readingKey(row.Batch, row.Step, 1)] = String(row.Reading1);
-      if(row.Reading2 !== "" && row.Reading2 != null) newReadings[readingKey(row.Batch, row.Step, 2)] = String(row.Reading2);
-      if(row.Reading3 !== "" && row.Reading3 != null) newReadings[readingKey(row.Batch, row.Step, 3)] = String(row.Reading3);
-    });
-
-    if(JSON.stringify(newReadings) !== JSON.stringify(readings)){
-      readings = newReadings;
+    const before = JSON.stringify(readings);
+    applyRecentRows(result);
+    if(JSON.stringify(readings) !== before){
       finished(true);
     } else {
       finished(false);
     }
   });
   fetchSharedTargets(finished);
-  fetchBatchCalendar(finished);
+  fetchBatchCalendar(didChange => {
+    if(didChange) saveReadingsCache();
+    finished(didChange);
+  });
 }
 
 
@@ -830,7 +1040,7 @@ function exportData(){
 
 document.getElementById("weekNumberInput").value = actualWeekNumber();
 document.getElementById("weekNumberInput").addEventListener("input", renderAll);
-document.getElementById("historyBatch").addEventListener("change", renderHistory);
+document.getElementById("historyBatch").addEventListener("change", handleHistoryBatchChange);
 renderAll();
 loadLiveData();
 setInterval(silentAutoRefresh, 30000);
