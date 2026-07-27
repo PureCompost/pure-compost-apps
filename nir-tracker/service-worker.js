@@ -1,4 +1,4 @@
-const CACHE_NAME = "pure-compost-nir-v6";
+const CACHE_NAME = "pure-compost-nir-v7";
 
 self.addEventListener("install", event => {
   event.waitUntil(
@@ -17,6 +17,12 @@ self.addEventListener("activate", event => {
           .map(key => caches.delete(key))
       ))
       .then(() => self.clients.claim())
+      .then(() => self.clients.matchAll({ type: "window", includeUncontrolled: true }))
+      .then(windowClients => Promise.all(
+        windowClients.map(client =>
+          client.navigate(client.url).catch(() => {})
+        )
+      ))
   );
 });
 

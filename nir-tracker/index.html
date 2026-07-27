@@ -1044,12 +1044,38 @@ document.getElementById("historyBatch").addEventListener("change", handleHistory
 renderAll();
 loadLiveData();
 setInterval(silentAutoRefresh, 30000);
+
+let appUpdateReloadStarted = false;
+function reloadForAppUpdate(){
+  if(appUpdateReloadStarted) return;
+  appUpdateReloadStarted = true;
+  window.location.reload();
+}
+async function checkForAppUpdate(){
+  if(!("serviceWorker" in navigator)) return;
+  try {
+    const registration = await navigator.serviceWorker.getRegistration();
+    if(registration) await registration.update();
+  } catch(e){}
+}
+
 document.addEventListener("visibilitychange", () => {
-  if(document.visibilityState === "visible") silentAutoRefresh();
+  if(document.visibilityState === "visible"){
+    checkForAppUpdate();
+    silentAutoRefresh();
+  }
 });
-window.addEventListener("focus", silentAutoRefresh);
+window.addEventListener("focus", () => {
+  checkForAppUpdate();
+  silentAutoRefresh();
+});
 if("serviceWorker" in navigator){
-  window.addEventListener("load", () => navigator.serviceWorker.register("service-worker.js").catch(() => {}));
+  navigator.serviceWorker.addEventListener("controllerchange", reloadForAppUpdate);
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("service-worker.js")
+      .then(registration => registration.update())
+      .catch(() => {});
+  });
 }
 </script>
 </body>
