@@ -1,4 +1,4 @@
-const CACHE_NAME = "pure-compost-nir-v5";
+const CACHE_NAME = "pure-compost-nir-v6";
 
 self.addEventListener("install", event => {
   event.waitUntil(
@@ -24,14 +24,21 @@ self.addEventListener("fetch", event => {
   if (event.request.method !== "GET") return;
 
   if (event.request.mode === "navigate") {
+    const updateFromNetwork = fetch(event.request)
+      .then(response => {
+        if (!response || !response.ok) return response;
+        const copy = response.clone();
+        return caches.open(CACHE_NAME)
+          .then(cache => cache.put("./index.html", copy))
+          .then(() => response);
+      });
+
+    event.waitUntil(updateFromNetwork.catch(() => {}));
+
     event.respondWith(
-      fetch(event.request)
-        .then(response => {
-          const copy = response.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put("./index.html", copy));
-          return response;
-        })
-        .catch(() => caches.match("./index.html"))
+      caches.match("./index.html")
+        .then(cached => cached || updateFromNetwork)
+        .catch(() => updateFromNetwork)
     );
     return;
   }
